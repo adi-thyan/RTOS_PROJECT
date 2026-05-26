@@ -1,0 +1,552 @@
+#define BLYNK_TEMPLATE_ID "TMPL3mpNgQ_Qr"
+#define BLYNK_TEMPLATE_NAME "chulliyil"
+#define BLYNK_AUTH_TOKEN "YNgs8wNU_Dfa4v4BYkfkEv4mPlrxKtqt"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <TinyGPS++.h>
+#include <math.h>
+
+// ---------------- WIFI ----------------
+char ssid[] = "GAUTHAM";
+char pass[] = "01234567";
+
+// ---------------- MPU ----------------
+#define MPU_SDA 21
+#define MPU_SCL 22
+MPU6050 mpu;
+
+// ---------------- GPS ----------------
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+// ---------------- PINS ----------------
+#define TRIG 13
+#define ECHO 12
+#define MQ2_PIN 34
+#define BUTTON_PIN 4
+#define BUZZER 27
+#define SERVO_PIN 18
+
+Servo myServo;
+
+// ---------------- STATE ----------------
+typedef enum { MOVING, STATIC } VehicleState;
+VehicleState currentState = STATIC;
+
+// ---------------- GLOBAL ----------------
+float distance_val = 0;
+int gas_val = 0;
+float accel_mag = 0;
+
+double latitude = 0;
+double longitude = 0;
+
+bool crash_flag = false;
+bool gas_sent = false;
+bool crash_sent = false;
+bool vent_open = false;
+
+// ---------------- QUEUE ----------------
+
+typedef struct {
+
+  String eventType;
+  String eventMessage;
+
+} AlertMessage;
+
+QueueHandle_t alertQueue;
+
+// =====================================================
+// ULTRASONIC
+// =====================================================
+
+float getDistance() {
+
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG, LOW);
+
+  long duration = pulseIn(ECHO, HIGH, 30000);
+
+  return duration * 0.034 / 2;
+}
+
+// =====================================================
+// BUTTON TASK
+// =====================================================
+
+void buttonTask(void *pv) {
+
+  while (1) {
+
+    currentState =
+      (digitalRead(BUTTON_PIN) == LOW)
+      ? MOVING : STATIC;
+
+    Serial.println(
+      currentState == MOVING
+      ? "STATE: MOVING"
+      : "STATE: STATIC"
+    );
+
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// OBSTACLE TASK
+// =====================================================
+
+void obstacleTask(void *pv) {
+
+  while (1) {
+
+    // Obstacle important only while moving
+
+    if (currentState == MOVING) {
+
+      distance_val = getDistance();
+
+      Serial.print("DIST: ");
+      Serial.println(distance_val);
+
+      if (distance_val < 20) {
+
+        digitalWrite(BUZZER, HIGH);
+
+        Serial.println("OBSTACLE DETECTED");
+
+      } else if (!vent_open && !crash_flag) {
+
+        digitalWrite(BUZZER, LOW);
+      }
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// GAS TASK
+// =====================================================
+
+void gasTask(void *pv) {
+
+  while (1) {
+
+    gas_val = analogRead(MQ2_PIN);
+
+    Serial.print("GAS: ");
+    Serial.println(gas_val);
+
+    // Gas critical mainly during STATIC
+
+    if (gas_val > 1500) {
+
+      // Ventilation
+
+      if (!vent_open) {
+
+        Serial.println("VENT OPEN");
+
+        myServo.write(90);
+
+        digitalWrite(BUZZER, HIGH);
+
+        vent_open = true;
+      }
+
+      // Queue Gas Alert
+
+      if (!gas_sent) {
+
+        AlertMessage alert;
+
+        alert.eventType = "co_leak";
+
+        if (currentState == STATIC) {
+
+          alert.eventMessage =
+            "CRITICAL GAS LEAK DETECTED!";
+
+        } else {
+
+          alert.eventMessage =
+            "Gas Leak Detected!";
+        }
+
+        xQueueSend(
+          alertQueue,
+          &alert,
+          portMAX_DELAY
+        );
+
+        Serial.println(
+          "GAS ALERT SENT TO QUEUE"
+        );
+
+        gas_sent = true;
+      }
+
+    } else {
+
+      if (vent_open) {
+
+        Serial.println("VENT CLOSED");
+
+        myServo.write(0);
+
+        if (!crash_flag)
+          digitalWrite(BUZZER, LOW);
+
+        vent_open = false;
+      }
+
+      gas_sent = false;
+    }
+
+    vTaskDelay(150 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// GPS TASK
+// =====================================================
+
+void gpsTask(void *pv) {
+
+  while (1) {
+
+    while (gpsSerial.available()) {
+
+      gps.encode(gpsSerial.read());
+    }
+
+    if (gps.location.isValid()) {
+
+      latitude = gps.location.lat();
+      longitude = gps.location.lng();
+
+      Serial.print("LAT: ");
+      Serial.println(latitude, 6);
+
+      Serial.print("LON: ");
+      Serial.println(longitude, 6);
+    }
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// CRASH TASK
+// =====================================================
+
+void crashTask(void *pv) {
+
+  while (1) {
+
+    int16_t ax, ay, az;
+
+    mpu.getAcceleration(&ax, &ay, &az);
+
+    float Ax = ax / 16384.0;
+    float Ay = ay / 16384.0;
+    float Az = az / 16384.0;
+
+    accel_mag =
+      sqrt(Ax * Ax + Ay * Ay + Az * Az);
+
+    float delta = fabs(accel_mag - 1.0);
+
+    Serial.print("ACCEL: ");
+    Serial.println(accel_mag);
+
+    // Highest Priority Emergency
+
+    if (delta > 0.8) {
+
+      crash_flag = true;
+
+      digitalWrite(BUZZER, HIGH);
+
+      if (!crash_sent) {
+
+        AlertMessage alert;
+
+        alert.eventType = "crash";
+
+        alert.eventMessage =
+          "CRASH DETECTED!\nLAT: " +
+          String(latitude, 6) +
+          "\nLON: " +
+          String(longitude, 6);
+
+        xQueueSend(
+          alertQueue,
+          &alert,
+          portMAX_DELAY
+        );
+
+        Serial.println(
+          "CRASH ALERT SENT TO QUEUE"
+        );
+
+        crash_sent = true;
+      }
+
+    } else {
+
+      crash_flag = false;
+      crash_sent = false;
+
+      if (!vent_open)
+        digitalWrite(BUZZER, LOW);
+    }
+
+    vTaskDelay(80 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// BLYNK TASK
+// =====================================================
+
+void blynkTask(void *pv) {
+
+  AlertMessage receivedAlert;
+
+  while (1) {
+
+    if (!Blynk.connected()) {
+
+      Serial.println("Reconnecting Blynk...");
+      Blynk.connect();
+    }
+
+    Blynk.run();
+
+    // ---------------- QUEUE RECEIVE ----------------
+
+    if (xQueueReceive(
+          alertQueue,
+          &receivedAlert,
+          0
+        ) == pdPASS) {
+
+      Serial.println(
+        "QUEUE ALERT RECEIVED"
+      );
+
+      Blynk.logEvent(
+        receivedAlert.eventType.c_str(),
+        receivedAlert.eventMessage.c_str()
+      );
+    }
+
+    // ---------------- VIRTUAL PINS ----------------
+
+    if (Blynk.connected()) {
+
+      Blynk.virtualWrite(V0, gas_val);
+
+      Blynk.virtualWrite(V1, distance_val);
+
+      Blynk.virtualWrite(V2, accel_mag);
+
+      Blynk.virtualWrite(
+        V3,
+        currentState == MOVING ? 1 : 0
+      );
+
+      Blynk.virtualWrite(V4, latitude);
+
+      Blynk.virtualWrite(V5, longitude);
+    }
+
+    Serial.print("Blynk Status: ");
+    Serial.println(Blynk.connected());
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // ---------------- GPS UART ----------------
+
+  gpsSerial.begin(
+    9600,
+    SERIAL_8N1,
+    16,
+    17
+  );
+
+  // ---------------- GPIO ----------------
+
+  pinMode(TRIG, OUTPUT);
+
+  pinMode(ECHO, INPUT);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER, OUTPUT);
+
+  // ---------------- MPU ----------------
+
+  Wire.begin(MPU_SDA, MPU_SCL);
+
+  mpu.initialize();
+
+  mpu.setSleepEnabled(false);
+
+  // ---------------- SERVO ----------------
+
+  ESP32PWM::allocateTimer(0);
+
+  myServo.setPeriodHertz(50);
+
+  myServo.attach(
+    SERVO_PIN,
+    500,
+    2400
+  );
+
+  myServo.write(0);
+
+  // ---------------- WIFI ----------------
+
+  WiFi.begin(ssid, pass);
+
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+
+  Serial.println(WiFi.localIP());
+
+  // ---------------- BLYNK ----------------
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  if (Blynk.connect(5000)) {
+
+    Serial.println("BLYNK CONNECTED");
+
+  } else {
+
+    Serial.println("BLYNK FAILED");
+  }
+
+  // ---------------- QUEUE CREATE ----------------
+
+  alertQueue = xQueueCreate(
+                 5,
+                 sizeof(AlertMessage)
+               );
+
+  if (alertQueue == NULL) {
+
+    Serial.println(
+      "QUEUE CREATION FAILED"
+    );
+  }
+
+  // =====================================================
+  // TASKS
+  // =====================================================
+  // PRIORITY BASED ON SAFETY CRITICALITY
+  //
+  // Crash     -> Highest Priority
+  // Obstacle  -> High during MOVING
+  // Gas       -> High during STATIC
+  // GPS       -> Medium
+  // Blynk     -> Low
+  // Button    -> Lowest
+  // =====================================================
+
+  xTaskCreatePinnedToCore(
+    crashTask,
+    "Crash",
+    4096,
+    NULL,
+    6,
+    NULL,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    obstacleTask,
+    "Obstacle",
+    4096,
+    NULL,
+    5,
+    NULL,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    gasTask,
+    "Gas",
+    4096,
+    NULL,
+    4,
+    NULL,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    gpsTask,
+    "GPS",
+    4096,
+    NULL,
+    3,
+    NULL,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    blynkTask,
+    "Blynk",
+    4096,
+    NULL,
+    2,
+    NULL,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    buttonTask,
+    "Button",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+}
+
+void loop() {
+}
